@@ -1,158 +1,72 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import express from "express";
-import { z } from "zod";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const app = express();
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-// ✅ PSX MCP Server
-const server = new McpServer({
-  name: "PSX Pakistan Stock Exchange",
-  version: "1.0.0",
+// CORS headers (Claude integration ke liye)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(200);
+  next();
 });
 
-// Helper: PSX data fetch karna
-async function fetchPSX(path) {
-  try {
-    const res = await fetch(`https://dps.psx.com.pk${path}`, {
-      headers: {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Referer": "https://www.psx.com.pk/",
-      },
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
-  } catch (err) {
-    return { error: err.message };
-  }
-}
-
-// ─────────────────────────────────────────
-// TOOL 1: Live stock quote
-// ─────────────────────────────────────────
-server.tool(
-  "get_stock_price",
-  {
-    symbol: z.string().describe("Stock symbol e.g. MEBL, ENGRO, LUCK, UBL"),
-  },
-  async ({ symbol }) => {
-    const data = await fetchPSX(`/symbol/${symbol.toUpperCase()}`);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
-  }
+const server = new Server(
+  { name: "psx-mcp", version: "1.0.0" },
+  { capabilities: { tools: {} } }
 );
 
-// ─────────────────────────────────────────
-// TOOL 2: KMI-30 Index (Halal stocks list)
-// ─────────────────────────────────────────
-server.tool(
-  "get_kmi30",
-  {},
-  async () => {
-    const data = await fetchPSX(`/indices/KMI30`);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
-  }
-);
+let transport;
 
-// ─────────────────────────────────────────
-// TOOL 3: Market summary (KSE-100 etc)
-// ─────────────────────────────────────────
-server.tool(
-  "get_market_summary",
-  {},
-  async () => {
-    const data = await fetchPSX(`/market-watch`);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
-  }
-);
-
-// ─────────────────────────────────────────
-// TOOL 4: Historical price data
-// ─────────────────────────────────────────
-server.tool(
-  "get_history",
-  {
-    symbol: z.string().describe("Stock symbol e.g. MEBL"),
-    from: z.string().describe("Start date YYYY-MM-DD"),
-    to: z.string().describe("End date YYYY-MM-DD"),
-  },
-  async ({ symbol, from, to }) => {
-    const data = await fetchPSX(
-      `/timeseries/eod?symbol=${symbol.toUpperCase()}&from=${from}&to=${to}`
-    );
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
-  }
-);
-
-// ─────────────────────────────────────────
-// TOOL 5: Top gainers & losers
-// ─────────────────────────────────────────
-server.tool(
-  "get_top_movers",
-  {},
-  async () => {
-    const data = await fetchPSX(`/market-watch/top-movers`);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
-  }
-);
-
-// ─────────────────────────────────────────
-// TOOL 6: Search stock by name
-// ─────────────────────────────────────────
-server.tool(
-  "search_stock",
-  {
-    query: z.string().describe("Company name e.g. Meezan, Engro, Lucky"),
-  },
-  async ({ query }) => {
-    const data = await fetchPSX(`/symbol?q=${encodeURIComponent(query)}`);
-    return {
-      content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    };
-  }
-);
-
-// ─────────────────────────────────────────
-// SSE Transport Setup (Claude ke liye)
-// ─────────────────────────────────────────
-const transports = {};
-
-app.get("/sse", async (req, res) => {
-  const transport = new SSEServerTransport("/messages", res);
-  transports[transport.sessionId] = transport;
-  res.on("close", () => {
-    delete transports[transport.sessionId];
-  });
-  await server.connect(transport);
+server.setRequestHandler(ListToolsRequestSchema, async () => {
+  return {
+    tools: [
+      {
+        name: "get_psx_stock",
+        description: "Fetch PSX stock data",
+        inputSchema: {
+          type: "object",
+          properties: {
+            symbol: { type: "string", description: "Stock symbol e.g. HUBC, FFC" }
+          },
+          required: ["symbol"]
+        }
+      }
+    ]
+  };
 });
 
-app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports[sessionId];
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).json({ error: "Session not found" });
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (request.params.name === "get_psx_stock") {
+    const symbol = request.params.arguments?.symbol;
+    return {
+      content: [{ type: "text", text: `PSX Stock Data for ${symbol}: Server Active` }]
+    };
   }
+  throw new Error("Tool not found");
 });
 
-// Health check
 app.get("/", (req, res) => {
   res.json({ status: "PSX MCP Server running ✅" });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`PSX MCP Server running on port ${PORT}`);
+app.get("/sse", async (req, res) => {
+  transport = new SSEServerTransport("/messages", res);
+  await server.connect(transport);
+});
+
+app.post("/messages", async (req, res) => {
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(400).send("No active SSE session");
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
