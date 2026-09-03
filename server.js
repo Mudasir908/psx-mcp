@@ -1,39 +1,114 @@
-import express from "express";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import express from "express";
+import { z } from "zod";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(express.json());
 
-// CORS headers (Claude integration ke liye)
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
+// Helper: PSX data fetch
+async function fetchPSX(path) {
+  try {
+    const res = await fetch(`https://dps.psx.com.pk${path}`, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer": "https://www.psx.com.pk/",
+      },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// Tool definitions — shared config
+function registerTools(server) {
+  server.tool(
+    "get_stock_price",
+    { symbol: z.string().describe("Stock symbol e.g. MEBL, ENGRO, LUCK") },
+    async ({ symbol }) => {
+      const data = await fetchPSX(`/symbol/${symbol.toUpperCase()}`);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool("get_kmi30", {}, async () => {
+    const data = await fetchPSX(`/indices/KMI30`);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool("get_market_summary", {}, async () => {
+    const data = await fetchPSX(`/market-watch`);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool(
+    "get_history",
+    {
+      symbol: z.string().describe("Stock symbol e.g. MEBL"),
+      from: z.string().describe("Start date YYYY-MM-DD"),
+      to: z.string().describe("End date YYYY-MM-DD"),
+    },
+    async ({ symbol, from, to }) => {
+      const data = await fetchPSX(`/timeseries/eod?symbol=${symbol.toUpperCase()}&from=${from}&to=${to}`);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+
+  server.tool("get_top_movers", {}, async () => {
+    const data = await fetchPSX(`/market-watch/top-movers`);
+    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  });
+
+  server.tool(
+    "search_stock",
+    { query: z.string().describe("Company name e.g. Meezan, Engro") },
+    async ({ query }) => {
+      const data = await fetchPSX(`/symbol?q=${encodeURIComponent(query)}`);
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    }
+  );
+}
+
+// SSE — NEW server instance per connection (fixes the error!)
+const transports = {};
+
+app.get("/sse", async (req, res) => {
+  const server = new McpServer({
+    name: "PSX Pakistan Stock Exchange",
+    version: "1.0.0",
+  });
+  registerTools(server);
+
+  const transport = new SSEServerTransport("/messages", res);
+  transports[transport.sessionId] = transport;
+
+  res.on("close", () => {
+    delete transports[transport.sessionId];
+  });
+
+  await server.connect(transport);
 });
 
-const server = new Server(
-  { name: "psx-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+app.post("/messages", async (req, res) => {
+  const transport = transports[req.query.sessionId];
+  if (transport) {
+    await transport.handlePostMessage(req, res);
+  } else {
+    res.status(400).json({ error: "Session not found" });
+  }
+});
 
-let transport;
+app.get("/", (req, res) => {
+  res.json({ status: "PSX MCP Server running ✅" });
+});
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
-      {
-        name: "get_psx_stock",
-        description: "Fetch PSX stock data",
-        inputSchema: {
-          type: "object",
-          properties: {
-            symbol: { type: "string", description: "Stock symbol e.g. HUBC, FFC" }
-          },
-          required: ["symbol"]
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`PSX MCP Server running on port ${PORT}`);
+});
         }
       }
     ]
