@@ -7,61 +7,82 @@ const app = express();
 app.use(express.json());
 
 // ─────────────────────────────────────────
-// PSX Data Fetcher — Multiple fallback URLs
+// Yahoo Finance — PSX stocks use .KA suffix
 // ─────────────────────────────────────────
-async function fetchPSX(path) {
-  // Try multiple PSX endpoints
-  const endpoints = [
-    `https://dps.psx.com.pk${path}`,
-    `https://www.psx.com.pk/api${path}`,
-  ];
-
-  for (const url of endpoints) {
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "Accept": "application/json, text/plain, */*",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-          "Referer": "https://www.psx.com.pk/",
-          "Origin": "https://www.psx.com.pk",
-          "Cache-Control": "no-cache",
-        },
-      });
-      if (res.ok) {
-        const text = await res.text();
-        try {
-          return JSON.parse(text);
-        } catch {
-          return { raw: text };
-        }
-      }
-    } catch (err) {
-      console.error(`Failed ${url}:`, err.message);
-    }
+async function fetchYahoo(symbol) {
+  try {
+    const ticker = `${symbol.toUpperCase()}.KA`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=5d`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+      },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (!meta) throw new Error("No data found");
+    return {
+      symbol: symbol.toUpperCase(),
+      name: meta.longName || meta.shortName || symbol,
+      price: meta.regularMarketPrice,
+      previousClose: meta.previousClose,
+      change: (meta.regularMarketPrice - meta.previousClose).toFixed(2),
+      changePercent: (((meta.regularMarketPrice - meta.previousClose) / meta.previousClose) * 100).toFixed(2) + "%",
+      dayHigh: meta.regularMarketDayHigh,
+      dayLow: meta.regularMarketDayLow,
+      volume: meta.regularMarketVolume,
+      marketCap: meta.marketCap,
+      currency: meta.currency,
+      exchange: meta.exchangeName,
+      fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh,
+      fiftyTwoWeekLow: meta.fiftyTwoWeekLow,
+    };
+  } catch (err) {
+    return { error: err.message, symbol: symbol.toUpperCase() };
   }
-  return { error: "Could not fetch PSX data — API may be blocked from this region" };
 }
 
 // ─────────────────────────────────────────
-// Scraper fallback — sarmaaya.pk
+// Yahoo Finance — Historical data
 // ─────────────────────────────────────────
-async function fetchStockFallback(symbol) {
+async function fetchHistory(symbol, from, to) {
   try {
-    const res = await fetch(`https://sarmaaya.pk/api/psx/quote/${symbol.toUpperCase()}`, {
-      headers: {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0",
-      },
+    const ticker = `${symbol.toUpperCase()}.KA`;
+    const fromTs = Math.floor(new Date(from).getTime() / 1000);
+    const toTs = Math.floor(new Date(to).getTime() / 1000);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&period1=${fromTs}&period2=${toTs}`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
     });
-    if (res.ok) return await res.json();
-    throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error("No historical data");
+    const timestamps = result.timestamp;
+    const closes = result.indicators?.quote?.[0]?.close;
+    const history = timestamps.map((ts, i) => ({
+      date: new Date(ts * 1000).toISOString().split("T")[0],
+      close: closes?.[i]?.toFixed(2),
+    }));
+    return { symbol: symbol.toUpperCase(), history };
   } catch (err) {
     return { error: err.message };
   }
 }
 
 // ─────────────────────────────────────────
-// Create new MCP server per connection
+// KMI-30 stocks list (static — always works)
+// ─────────────────────────────────────────
+const KMI30_STOCKS = [
+  "MEBL","ENGRO","LUCK","PSO","OGDC","PPL","HBL","UBL","MCB","BAFL",
+  "FFBL","FFC","HUBC","KAPCO","KEL","MLCF","MTL","NCPL","PKGS","PSMC",
+  "SEARL","SHEL","SYS","TRG","UNITY","YOUW","FABL","SILK","ACPL","CHCC"
+];
+
+// ─────────────────────────────────────────
+// Create MCP Server
 // ─────────────────────────────────────────
 function createServer() {
   const server = new McpServer({
@@ -72,28 +93,33 @@ function createServer() {
   // TOOL 1: Live stock price
   server.tool(
     "get_stock_price",
-    { symbol: z.string().describe("PSX symbol e.g. MEBL, ENGRO, LUCK, UBL") },
+    { symbol: z.string().describe("PSX symbol e.g. MEBL, ENGRO, LUCK, UBL, OGDC") },
     async ({ symbol }) => {
-      let data = await fetchPSX(`/symbol/${symbol.toUpperCase()}`);
-      // Fallback if PSX API fails
-      if (data.error) {
-        data = await fetchStockFallback(symbol);
-      }
+      const data = await fetchYahoo(symbol);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
 
-  // TOOL 2: KMI-30 halal stocks
+  // TOOL 2: KMI-30 list
   server.tool("get_kmi30", {}, async () => {
-    const data = await fetchPSX("/indices/KMI30");
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ kmi30_stocks: KMI30_STOCKS, total: KMI30_STOCKS.length }, null, 2)
+      }]
+    };
   });
 
-  // TOOL 3: Market summary
-  server.tool("get_market_summary", {}, async () => {
-    const data = await fetchPSX("/market-watch");
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-  });
+  // TOOL 3: Multiple stocks at once
+  server.tool(
+    "get_multiple_stocks",
+    { symbols: z.string().describe("Comma separated symbols e.g. MEBL,ENGRO,LUCK") },
+    async ({ symbols }) => {
+      const list = symbols.split(",").map(s => s.trim()).slice(0, 5);
+      const results = await Promise.all(list.map(fetchYahoo));
+      return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+    }
+  );
 
   // TOOL 4: Historical data
   server.tool(
@@ -104,26 +130,19 @@ function createServer() {
       to: z.string().describe("End date YYYY-MM-DD"),
     },
     async ({ symbol, from, to }) => {
-      const data = await fetchPSX(
-        `/timeseries/eod?symbol=${symbol.toUpperCase()}&from=${from}&to=${to}`
-      );
+      const data = await fetchHistory(symbol, from, to);
       return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
     }
   );
 
-  // TOOL 5: Top movers
-  server.tool("get_top_movers", {}, async () => {
-    const data = await fetchPSX("/market-watch/top-movers");
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-  });
-
-  // TOOL 6: Search stock
+  // TOOL 5: Top KMI-30 stocks snapshot
   server.tool(
-    "search_stock",
-    { query: z.string().describe("Company name e.g. Meezan, Engro, Lucky") },
-    async ({ query }) => {
-      const data = await fetchPSX(`/symbol?q=${encodeURIComponent(query)}`);
-      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    "get_top_kmi30",
+    {},
+    async () => {
+      const top5 = ["MEBL", "ENGRO", "LUCK", "OGDC", "HBL"];
+      const results = await Promise.all(top5.map(fetchYahoo));
+      return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
     }
   );
 
@@ -131,7 +150,7 @@ function createServer() {
 }
 
 // ─────────────────────────────────────────
-// SSE — New server per connection
+// SSE Transport
 // ─────────────────────────────────────────
 const transports = {};
 
@@ -157,16 +176,13 @@ app.post("/messages", async (req, res) => {
       res.status(400).json({ error: "Session not found" });
     }
   } catch (err) {
-    console.error("Message error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Health checks
 app.get("/", (req, res) => res.status(200).json({ status: "PSX MCP Server running ✅" }));
 app.get("/health", (req, res) => res.status(200).json({ status: "ok" }));
 
-// Prevent crashes
 process.on("uncaughtException", (err) => console.error("Uncaught:", err.message));
 process.on("unhandledRejection", (err) => console.error("Rejection:", err));
 
